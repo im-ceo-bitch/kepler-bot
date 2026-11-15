@@ -1,192 +1,68 @@
-name: Update & Deploy Telegram Bot
-
+name: Telegram Bot - verify unified backend
 on:
   push:
     branches: [main]
-    paths:
-      - "anonymous-chat-bot-*.zip"
+    paths: ['anonymous-chat-bot-v38-unified-cleanup.zip']
   workflow_dispatch:
-
 permissions:
   contents: write
-
 concurrency:
   group: telegram-bot-update-deploy
   cancel-in-progress: false
-
 jobs:
-  update-and-deploy:
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-
+  cleanup-and-verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-
-      - name: Find and safely extract update
+      - name: Apply exact cleanup archive
         if: github.event_name == 'push'
         shell: bash
         run: |
           set -euo pipefail
-
-          ZIP_FILE="$(find . -maxdepth 1 -type f -name 'anonymous-chat-bot-*.zip' -printf '%f\n' | sort -V | tail -n 1)"
-
-          if [ -z "${ZIP_FILE}" ]; then
-            echo "No anonymous-chat-bot ZIP found."
-            exit 1
-          fi
-
-          echo "Applying ${ZIP_FILE}"
-
-          TMP_DIR="$(mktemp -d)"
-          trap 'rm -rf "${TMP_DIR}"' EXIT
-
-          unzip -q -o "${ZIP_FILE}" -d "${TMP_DIR}"
-
-          # Workflow files are managed manually. Never let an update ZIP
-          # replace or create GitHub Actions workflows.
-          rm -rf "${TMP_DIR}/.github/workflows"
-
-          rsync -a "${TMP_DIR}/" ./
-          rm -f anonymous-chat-bot-*.zip
-
-      - name: Commit applied update
+          python3 - <<'PYTHON'
+          import pathlib, zipfile, stat
+          root=pathlib.Path.cwd().resolve()
+          archive=root/'anonymous-chat-bot-v38-unified-cleanup.zip'
+          allowed=set(['.gitignore', 'README.md', 'package.json', 'scripts/verify-webhook.mjs'])
+          legacy=['.env.example', 'BOOKING_LINK_AUTH_FIX.md', 'BOOKING_LINK_FIX_V4.md', 'BOOKING_LINK_FIX_V5_522.md', 'BOOKING_MINI_APP_IOS_PARITY_V7.md', 'BOOKING_MINI_APP_V71_PRODUCTION.md', 'BOOKING_MINI_APP_V72_CARE_TABS.md', 'BOT_STATUS_UI_LOCALIZATION_V6.md', 'BOT_V74_CHAT_UX_CALL_DELETE.md', 'BOT_V75_DIRECT_SERVER.md', 'BOT_V77_LIVE_SUPPORT.md', 'BOT_V78_ERROR_ART.md', 'BOT_V79_SYNC_CONSISTENCY.md', 'BOT_V80_CARE_DEDUP.md', 'BOT_V81_CARE_AND_NOT_LINKED_PHOTO.md', 'BOT_V82_PREMIUM_MINI_APP.md', 'BOT_V83_MINI_EMPTY_STATE_FIX.md', 'IUMRAH_APP_TELEGRAM_BOOKING_BRIDGE_20260930_APPLIED.txt', 'IUMRAH_TELEGRAM_ACCOUNT_LINK_FIX_20260930_APPLIED.txt', 'IUMRAH_TELEGRAM_STATUS_STATE_20261001_APPLIED.txt', 'anonymous-chat-bot-account-link-fix-20260930-manifest.json', 'anonymous-chat-bot-telegram-booking-bridge-20260930-manifest.json', 'anonymous-chat-bot-telegram-status-state-20261001-manifest.json', 'iumrah-update.zip', 'migrations/0001_init.sql', 'migrations/0002_sirdosh_v2.sql', 'migrations/0003_iumrah_booking_bot.sql', 'scripts/resolve-d1.mjs', 'scripts/resolve-worker-url.mjs', 'scripts/set-webhook.mjs', 'src/index.ts', 'src/mini-assets.ts', 'src/mini-v7.ts', 'src/status-assets.ts', 'src/support-assets.ts', 'tsconfig.json', 'wrangler.jsonc']
+          if not archive.is_file() or archive.is_symlink(): raise SystemExit('Expected exact V38 cleanup ZIP')
+          with zipfile.ZipFile(archive) as z:
+              entries=z.infolist()
+              if len(entries)!=len(allowed) or {i.filename for i in entries}!=allowed: raise SystemExit('Unexpected ZIP paths')
+              if any(i.is_dir() or stat.S_ISLNK(i.external_attr>>16) or i.file_size>1_000_000 for i in entries): raise SystemExit('Invalid archive entry')
+              content={i.filename:z.read(i) for i in entries}
+          for name in sorted(allowed|set(legacy)):
+              p=root/name
+              if not p.resolve().is_relative_to(root) or p.is_symlink() or any(a.is_symlink() for a in p.parents if a!=root): raise SystemExit('Unsafe path')
+          for name,data in content.items():
+              p=root/name; p.parent.mkdir(parents=True,exist_ok=True); p.write_bytes(data)
+          for name in legacy:
+              (root/name).unlink(missing_ok=True)
+          for name in ('src','migrations','scripts'):
+              p=root/name
+              if p.is_dir() and not any(p.iterdir()): p.rmdir()
+          archive.unlink()
+          print('Legacy deploy code removed; read-only verifier installed.')
+          PYTHON
+      - name: Commit cleanup
         if: github.event_name == 'push'
         shell: bash
         run: |
           set -euo pipefail
-
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git add -A
-
-          if git diff --cached --quiet; then
-            echo "Nothing to commit. Continuing to deploy current repository state."
-          else
-            git commit -m "Apply bot update"
+          if ! git diff --cached --quiet; then
+            git commit -m 'Retire legacy Telegram Worker; use unified backend'
             git push
           fi
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
+      - uses: actions/setup-node@v4
         with:
-          node-version: 22
-
-      - name: Install dependencies
-        run: npm install --no-audit --no-fund
-
-      - name: Typecheck
-        run: npm run typecheck
-
-      - name: Resolve or create D1 database
-        id: d1
-        env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          D1_DATABASE_ID="$(node scripts/resolve-d1.mjs)"
-          test -n "$D1_DATABASE_ID"
-          echo "database_id=$D1_DATABASE_ID" >> "$GITHUB_OUTPUT"
-          sed -i "s/__D1_DATABASE_ID__/$D1_DATABASE_ID/g" wrangler.jsonc
-          grep -q "$D1_DATABASE_ID" wrangler.jsonc
-
-      - name: Apply D1 migrations
-        env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-        run: npx wrangler d1 migrations apply anonymous-chat-db --remote
-
-      - name: Deploy Worker
-        env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          for attempt in 1 2 3; do
-            echo "Wrangler deploy attempt ${attempt}/3"
-            if npx wrangler deploy; then
-              exit 0
-            fi
-
-            if [ "$attempt" -lt 3 ]; then
-              sleep $((attempt * 15))
-            fi
-          done
-
-          echo "Wrangler deploy failed after 3 attempts."
-          exit 1
-
-      - name: Generate webhook secret
-        id: webhook_secret
-        shell: bash
-        run: |
-          set -euo pipefail
-          WEBHOOK_SECRET="$(node -e "console.log(require('crypto').randomBytes(32).toString('base64url'))")"
-          echo "::add-mask::$WEBHOOK_SECRET"
-          echo "value=$WEBHOOK_SECRET" >> "$GITHUB_OUTPUT"
-
-      - name: Upload Telegram bot token
-        env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          test -n "$TELEGRAM_BOT_TOKEN"
-          printf '%s' "$TELEGRAM_BOT_TOKEN" | npx wrangler secret put TELEGRAM_BOT_TOKEN
-
-      - name: Upload webhook secret
-        env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          TELEGRAM_WEBHOOK_SECRET: ${{ steps.webhook_secret.outputs.value }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          test -n "$TELEGRAM_WEBHOOK_SECRET"
-          printf '%s' "$TELEGRAM_WEBHOOK_SECRET" | npx wrangler secret put TELEGRAM_WEBHOOK_SECRET
-
-      - name: Resolve Worker URL
-        id: worker_url
-        env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          WORKER_URL="$(node scripts/resolve-worker-url.mjs)"
-          test -n "$WORKER_URL"
-          echo "url=$WORKER_URL" >> "$GITHUB_OUTPUT"
-          echo "Worker URL: $WORKER_URL"
-
-      - name: Health check
-        shell: bash
-        run: |
-          set -euo pipefail
-          URL="${{ steps.worker_url.outputs.url }}/health"
-
-          for attempt in 1 2 3 4 5; do
-            if curl --fail --silent --show-error "$URL"; then
-              echo
-              exit 0
-            fi
-            sleep 5
-          done
-
-          echo "Health check failed after 5 attempts."
-          exit 1
-
-      - name: Configure Telegram webhook
+          node-version: '22'
+      - name: Verify webhook and Mini App (read-only)
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_WEBHOOK_SECRET: ${{ steps.webhook_secret.outputs.value }}
-          WORKER_URL: ${{ steps.worker_url.outputs.url }}
-        run: node scripts/set-webhook.mjs
+        run: npm run check
